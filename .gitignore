@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+venv/
+env/
+
+.idea/
+.vscode/
+
+data/
+outputs/
+
+*.tar.gz
+
+# модели не заливаем
+models/*.pth
+
+# системные файлы
+.DS_Store
+Thumbs.db
