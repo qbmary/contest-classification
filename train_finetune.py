@@ -1,187 +1,100 @@
 import os
-import random
-from pathlib import Path
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Subset
-from torchvision import datasets, transforms, models
+from torchvision import transforms
 
-from config import *
+import config
+from dataset_loader import load_datasets, create_dataloaders, set_seed
+from models import create_finetune_model, get_trainable_parameters
+from train_utils import train_one_epoch, evaluate_classification, save_checkpoint, save_training_summary
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", device)
 
-os.makedirs(MODELS_DIR, exist_ok=True)
-os.makedirs(OUTPUTS_DIR, exist_ok=True)
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
 
-random.seed(SEED)
-torch.manual_seed(SEED)
+    os.makedirs(config.MODELS_DIR, exist_ok=True)
+    os.makedirs(config.OUTPUTS_DIR, exist_ok=True)
 
-transform_train = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-])
+    set_seed(config.SEED)
+    torch.manual_seed(config.SEED)
 
-transform_val = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-])
+    train_transform = transforms.Compose([
+        transforms.Resize((config.IMG_SIZE, config.IMG_SIZE)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+    ])
 
-def has_class_folders(path):
-    path = Path(path)
-    if not path.exists():
-        return False
-    subfolders = [p for p in path.iterdir() if p.is_dir()]
-    return len(subfolders) > 0
+    eval_transform = transforms.Compose([
+        transforms.Resize((config.IMG_SIZE, config.IMG_SIZE)),
+        transforms.ToTensor(),
+    ])
 
-if has_class_folders(TRAIN_DIR) and has_class_folders(VAL_DIR):
-    print("Режим: отдельные папки train и val")
-
-    train_dataset = datasets.ImageFolder(TRAIN_DIR, transform=transform_train)
-    val_dataset = datasets.ImageFolder(VAL_DIR, transform=transform_val)
-
-    class_names = train_dataset.classes
-
-elif has_class_folders(TRAIN_DIR):
-    print("Режим: есть только train, val создаётся автоматически")
-
-    full_dataset = datasets.ImageFolder(TRAIN_DIR, transform=transform_train)
-    class_names = full_dataset.classes
-
-    indices = list(range(len(full_dataset)))
-    random.shuffle(indices)
-
-    val_size = int(len(full_dataset) * VAL_SPLIT)
-    train_size = len(full_dataset) - val_size
-
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-
-    train_dataset = Subset(full_dataset, train_indices)
-
-    full_dataset_val = datasets.ImageFolder(TRAIN_DIR, transform=transform_val)
-    val_dataset = Subset(full_dataset_val, val_indices)
-
-elif has_class_folders(DATA_DIR):
-    print("Режим: классы лежат сразу в папке data, val создаётся автоматически")
-
-    full_dataset = datasets.ImageFolder(DATA_DIR, transform=transform_train)
-    class_names = full_dataset.classes
-
-    indices = list(range(len(full_dataset)))
-    random.shuffle(indices)
-
-    val_size = int(len(full_dataset) * VAL_SPLIT)
-    train_size = len(full_dataset) - val_size
-
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-
-    train_dataset = Subset(full_dataset, train_indices)
-
-    full_dataset_val = datasets.ImageFolder(DATA_DIR, transform=transform_val)
-    val_dataset = Subset(full_dataset_val, val_indices)
-
-else:
-    raise FileNotFoundError(
-        "Не найдены папки классов.\n"
-        "Нужен один из вариантов:\n"
-        "1) data/train/class_name/...\n"
-        "2) data/class_name/..."
+    train_dataset, val_dataset, test_dataset, class_names = load_datasets(
+        config, train_transform, eval_transform
     )
 
-num_classes = len(class_names)
-print("Classes:", class_names)
-print("Train samples:", len(train_dataset))
-print("Val samples:", len(val_dataset))
+    train_loader, val_loader, _ = create_dataloaders(
+        config, train_dataset, val_dataset, test_dataset
+    )
 
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=NUM_WORKERS
-)
+    print("Classes:", class_names)
+    print("Train samples:", len(train_dataset))
+    print("Val samples:", len(val_dataset))
 
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=NUM_WORKERS
-)
+    model = create_finetune_model(
+        num_classes=len(class_names),
+        freeze_backbone=True
+    ).to(device)
 
-weights = models.ResNet18_Weights.DEFAULT
-model = models.resnet18(weights=weights)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(
+        get_trainable_parameters(model),
+        lr=config.LEARNING_RATE
+    )
 
-for param in model.parameters():
-    param.requires_grad = False
+    best_acc = 0.0
+    history = []
 
-in_features = model.fc.in_features
-model.fc = nn.Linear(in_features, num_classes)
+    for epoch in range(config.EPOCHS):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_metrics = evaluate_classification(model, val_loader, criterion, device)
 
-model = model.to(device)
+        epoch_info = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_loss": val_metrics["loss"],
+            "val_accuracy": val_metrics["accuracy"],
+            "val_f1_weighted": val_metrics["f1_weighted"],
+        }
+        history.append(epoch_info)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.fc.parameters(), lr=LEARNING_RATE)
+        print(f"\nEpoch {epoch + 1}/{config.EPOCHS}")
+        print(f"train_loss = {train_loss:.4f}")
+        print(f"val_loss   = {val_metrics['loss']:.4f}")
+        print(f"val_acc    = {val_metrics['accuracy']:.4f}")
+        print(f"val_f1     = {val_metrics['f1_weighted']:.4f}")
 
-best_acc = 0.0
+        if val_metrics["accuracy"] > best_acc:
+            best_acc = val_metrics["accuracy"]
+            save_path = config.MODELS_DIR / config.FINETUNE_MODEL_NAME
+            save_checkpoint(
+                save_path,
+                model,
+                class_names,
+                config.IMG_SIZE,
+                model_type="finetune"
+            )
+            print("Model saved:", save_path)
 
-for epoch in range(EPOCHS):
-    model.train()
-    train_loss = 0.0
+    history_path = config.OUTPUTS_DIR / "finetune_training_history.json"
+    save_training_summary(history_path, history)
 
-    print(f"\nEpoch {epoch + 1}/{EPOCHS}")
+    print("\nTraining finished")
+    print("Best val_acc:", best_acc)
+    print("History saved:", history_path)
 
-    for batch_idx, (images, labels) in enumerate(train_loader):
-        images = images.to(device)
-        labels = labels.to(device)
 
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        train_loss += loss.item()
-
-        if batch_idx % 10 == 0:
-            print(f"  batch {batch_idx}/{len(train_loader)}")
-
-    model.eval()
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-        for images, labels in val_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-
-            outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
-
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-
-    acc = correct / total if total > 0 else 0.0
-    avg_loss = train_loss / len(train_loader)
-
-    print(f"loss = {avg_loss:.4f}")
-    print(f"val_acc = {acc:.4f}")
-
-    if acc > best_acc:
-        best_acc = acc
-        save_path = MODELS_DIR / "classifier_finetune.pth"
-
-        torch.save({
-            "model_state_dict": model.state_dict(),
-            "class_names": class_names,
-            "img_size": IMG_SIZE,
-            "model_type": "resnet18"
-        }, save_path)
-
-        print("Model saved:", save_path)
-
-print("\nTraining finished")
-print("Best val_acc:", best_acc)
+if __name__ == "__main__":
+    main()
